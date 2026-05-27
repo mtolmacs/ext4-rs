@@ -22,6 +22,7 @@
 //! assert_eq!(&data, b"hello world");
 //! ```
 
+pub mod checksum;
 pub mod constants;
 pub mod dir;
 pub mod error;

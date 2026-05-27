@@ -11,6 +11,7 @@ use std::path::Path;
 
 use uuid::Uuid;
 
+use crate::checksum;
 use crate::constants::*;
 use crate::dir;
 use crate::error::{FormatError, FormatResult};
@@ -1023,6 +1024,11 @@ impl Formatter {
             let free_blocks_count = blocks_in_group.saturating_sub(inode_table_size_per_group + 2);
             let free_inodes_count = inodes_per_group;
 
+            // BLOCK_UNINIT lets the bitmap be reconstructed on demand;
+            // INODE_UNINIT, paired with itable_unused_lo, lets the entire
+            // inode table be treated as uninitialized.  Together they let
+            // resize2fs extend the filesystem without fallocating the new
+            // inode tables -- a ~2 MiB-per-added-group cost on btrfs.
             group_descriptors.push(GroupDescriptor {
                 block_bitmap_lo: bb_offset,
                 inode_bitmap_lo: ib_offset,
@@ -1030,11 +1036,11 @@ impl Formatter {
                 free_blocks_count_lo: free_blocks_count as u16,
                 free_inodes_count_lo: free_inodes_count as u16,
                 used_dirs_count_lo: 0,
-                flags: 0,
+                flags: bg_flags::BLOCK_UNINIT | bg_flags::INODE_UNINIT,
                 exclude_bitmap_lo: 0,
                 block_bitmap_csum_lo: 0,
                 inode_bitmap_csum_lo: 0,
-                itable_unused_lo: 0,
+                itable_unused_lo: inodes_per_group as u16,
                 checksum: 0,
             });
 
@@ -1063,10 +1069,18 @@ impl Formatter {
             }
         }
 
+        // Settle the UUID now so the group descriptor checksums and the
+        // superblock agree on it.
+        let uuid = self.uuid.unwrap_or_else(Uuid::new_v4);
+        let uuid_bytes = *uuid.as_bytes();
+
         // -- Step 6: Write group descriptors at block 1 --
+        // With `gdt_csum`, each descriptor carries a CRC-16 over the
+        // filesystem UUID, its group number, and the descriptor body.
         self.seek_to_block(1)?;
         let mut gd_buf = vec![0u8; GroupDescriptor::SIZE];
-        for gd in &group_descriptors {
+        for (group_nr, gd) in group_descriptors.iter_mut().enumerate() {
+            gd.checksum = checksum::group_descriptor(&uuid_bytes, group_nr as u32, gd);
             gd.write_to(&mut gd_buf);
             self.file.write_all(&gd_buf)?;
         }
@@ -1107,12 +1121,18 @@ impl Formatter {
         sb.feature_compat = compat::SPARSE_SUPER2 | compat::EXT_ATTR;
         sb.feature_incompat =
             incompat::FILETYPE | incompat::EXTENTS | incompat::FLEX_BG;
-        sb.feature_ro_compat =
-            ro_compat::LARGE_FILE | ro_compat::HUGE_FILE | ro_compat::EXTRA_ISIZE;
+        sb.feature_ro_compat = ro_compat::LARGE_FILE
+            | ro_compat::HUGE_FILE
+            | ro_compat::EXTRA_ISIZE
+            // `gdt_csum` (group-descriptor CRC-16) is what makes resize2fs
+            // honour BG_*_UNINIT flags on the new groups it creates -- and
+            // therefore skip the per-group fallocate that otherwise burns
+            // ~2 MiB per added block group on btrfs.
+            | ro_compat::GDT_CSUM;
         sb.min_extra_isize = EXTRA_ISIZE;
         sb.want_extra_isize = EXTRA_ISIZE;
         sb.log_groups_per_flex = 31;
-        sb.uuid = *self.uuid.unwrap_or_else(Uuid::new_v4).as_bytes();
+        sb.uuid = uuid_bytes;
         if let Some(label) = &self.label {
             let bytes = label.as_bytes();
             sb.volume_name[..bytes.len()].copy_from_slice(bytes);
